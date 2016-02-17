@@ -38,6 +38,7 @@ import com.amazonaws.ClientConfiguration;
 import com.amazonaws.Protocol;
 import com.amazonaws.auth.AWSCredentialsProviderChain;
 
+import com.amazonaws.auth.EnvironmentVariableCredentialsProvider;
 import com.amazonaws.auth.InstanceProfileCredentialsProvider;
 import com.amazonaws.services.s3.AmazonS3Client;
 import com.amazonaws.services.s3.model.CannedAccessControlList;
@@ -172,6 +173,7 @@ public class S3AFileSystem extends FileSystem {
     }
 
     AWSCredentialsProviderChain credentials = new AWSCredentialsProviderChain(
+        new EnvironmentVariableCredentialsProvider(),
         new BasicAWSCredentialsProvider(accessKey, secretKey),
         new InstanceProfileCredentialsProvider(),
         new AnonymousAWSCredentialsProvider()
