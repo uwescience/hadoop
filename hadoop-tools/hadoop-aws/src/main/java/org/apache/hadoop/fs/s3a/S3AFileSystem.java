@@ -23,6 +23,7 @@ import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.ArrayList;
 import java.util.Date;
 import java.util.List;
@@ -36,6 +37,7 @@ import com.amazonaws.AmazonClientException;
 import com.amazonaws.AmazonServiceException;
 import com.amazonaws.ClientConfiguration;
 import com.amazonaws.Protocol;
+import com.amazonaws.auth.AWSCredentialsProvider;
 import com.amazonaws.auth.AWSCredentialsProviderChain;
 
 import com.amazonaws.auth.EnvironmentVariableCredentialsProvider;
@@ -68,6 +70,7 @@ import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.LocalFileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.fs.permission.FsPermission;
+import org.apache.hadoop.security.alias.CredentialProviderFactory;
 import org.apache.hadoop.util.Progressable;
 
 import static org.apache.hadoop.fs.s3a.Constants.*;
@@ -80,6 +83,7 @@ public class S3AFileSystem extends FileSystem {
    * Default blocksize as used in blocksize and FS status queries
    */
   public static final int DEFAULT_BLOCKSIZE = 32 * 1024 * 1024;
+  private static final String AWS_CREDENTIALS_PROVIDER = "fs.s3a.aws.credentials.provider";
   private URI uri;
   private Path workingDir;
   private AmazonS3Client s3;
@@ -172,12 +176,8 @@ public class S3AFileSystem extends FileSystem {
       }
     }
 
-    AWSCredentialsProviderChain credentials = new AWSCredentialsProviderChain(
-        new EnvironmentVariableCredentialsProvider(),
-        new BasicAWSCredentialsProvider(accessKey, secretKey),
-        new InstanceProfileCredentialsProvider(),
-        new AnonymousAWSCredentialsProvider()
-    );
+    AWSCredentialsProvider credentials =
+        getAWSCredentialsProvider(name, conf);
 
     bucket = name.getHost();
 
@@ -314,6 +314,104 @@ public class S3AFileSystem extends FileSystem {
     serverSideEncryptionAlgorithm = conf.get(SERVER_SIDE_ENCRYPTION_ALGORITHM);
 
     setConf(conf);
+  }
+
+  /**
+   * Return the access key and secret for S3 API use.
+   * Credentials may exist in configuration, within credential providers
+   * or indicated in the UserInfo of the name URI param.
+   * @param name the URI for which we need the access keys.
+   * @param conf the Configuration object to interogate for keys.
+   * @return AWSAccessKeys
+   */
+  AWSAccessKeys getAWSAccessKeys(URI name, Configuration conf)
+      throws IOException {
+    String accessKey = null;
+    String secretKey = null;
+    String userInfo = name.getUserInfo();
+    if (userInfo != null) {
+      int index = userInfo.indexOf(':');
+      if (index != -1) {
+        accessKey = userInfo.substring(0, index);
+        secretKey = userInfo.substring(index + 1);
+      } else {
+        accessKey = userInfo;
+      }
+    }
+    Configuration c = excludeIncompatibleCredentialProviders(
+          conf, S3AFileSystem.class);
+    if (accessKey == null) {
+      try {
+        final char[] key = c.getPassword(ACCESS_KEY);
+        if (key != null) {
+          accessKey = (new String(key)).trim();
+        }
+      } catch(IOException ioe) {
+        throw new IOException("Cannot find AWS access key.", ioe);
+      }
+    }
+    if (secretKey == null) {
+      try {
+        final char[] pass = c.getPassword(SECRET_KEY);
+        if (pass != null) {
+          secretKey = (new String(pass)).trim();
+        }
+      } catch(IOException ioe) {
+        throw new IOException("Cannot find AWS secret key.", ioe);
+      }
+    }
+    return new AWSAccessKeys(accessKey, secretKey);
+  }
+
+  /**
+   * Create the standard credential provider, or load in one explicitly
+   * identified in the configuration.
+   * @param binding the S3 binding/bucket.
+   * @param conf configuration
+   * @return a credential provider
+   * @throws IOException on any problem. Class construction issues may be
+   * nested inside the IOE.
+   */
+  private AWSCredentialsProvider getAWSCredentialsProvider(URI binding,
+      Configuration conf) throws IOException {
+    AWSCredentialsProvider credentials;
+
+    String className = conf.getTrimmed(AWS_CREDENTIALS_PROVIDER);
+    if (StringUtils.isEmpty(className)) {
+      AWSAccessKeys creds = getAWSAccessKeys(binding, conf);
+      credentials = new AWSCredentialsProviderChain(
+          new BasicAWSCredentialsProvider(
+              creds.getAccessKey(), creds.getAccessSecret()),
+          new InstanceProfileCredentialsProvider(),
+          new EnvironmentVariableCredentialsProvider());
+
+    } else {
+      try {
+        LOG.debug("Credential provider class is {}", className);
+        Class<?> credClass = Class.forName(className);
+        try {
+          credentials =
+              (AWSCredentialsProvider)credClass.getDeclaredConstructor(
+                  URI.class, Configuration.class).newInstance(this.uri, conf);
+        } catch (NoSuchMethodException | SecurityException e) {
+          credentials =
+              (AWSCredentialsProvider)credClass.getDeclaredConstructor()
+                  .newInstance();
+        }
+      } catch (ClassNotFoundException e) {
+        throw new IOException(className + " not found.", e);
+      } catch (NoSuchMethodException | SecurityException e) {
+        throw new IOException(String.format("%s constructor exception.  A "
+            + "class specified in %s must provide an accessible constructor "
+            + "accepting URI and Configuration, or an accessible default "
+            + "constructor.", className, AWS_CREDENTIALS_PROVIDER), e);
+      } catch (ReflectiveOperationException | IllegalArgumentException e) {
+        throw new IOException(className + " instantiation exception.", e);
+      }
+      LOG.debug("Using {} for {}.", credentials, this.uri);
+    }
+
+    return credentials;
   }
 
   /**
@@ -1224,5 +1322,143 @@ public class S3AFileSystem extends FileSystem {
         "a serious internal problem while trying to communicate with S3, " +
         "such as not being able to access the network.");
     LOG.info("Error Message: {}" + ace, ace);
+  }
+
+  /**
+   * This is a simple encapsulation of the
+   * S3 access key and secret.
+   */
+  static class AWSAccessKeys {
+    private String accessKey = null;
+    private String accessSecret = null;
+
+    /**
+     * Constructor.
+     * @param key - AWS access key
+     * @param secret - AWS secret key
+     */
+    public AWSAccessKeys(String key, String secret) {
+      accessKey = key;
+      accessSecret = secret;
+    }
+
+    /**
+     * Return the AWS access key.
+     * @return key
+     */
+    public String getAccessKey() {
+      return accessKey;
+    }
+
+    /**
+     * Return the AWS secret key.
+     * @return secret
+     */
+    public String getAccessSecret() {
+      return accessSecret;
+    }
+  }
+
+  /**
+   * There are certain integrations of the credential provider API in
+   * which a recursive dependency between the provider and the hadoop
+   * filesystem abstraction causes a problem. These integration points
+   * need to leverage this utility method to remove problematic provider
+   * types from the existing provider path within the configuration.
+   *
+   * @param config the existing configuration with provider path
+   * @param fileSystemClass the class which providers must be compatible
+   * @return Configuration clone with new provider path
+   */
+  private static Configuration excludeIncompatibleCredentialProviders(
+      Configuration config, Class<? extends FileSystem> fileSystemClass)
+          throws IOException {
+
+    String providerPath = config.get(
+        CredentialProviderFactory.CREDENTIAL_PROVIDER_PATH);
+
+    if (providerPath == null) {
+      return config;
+    }
+    StringBuffer newProviderPath = new StringBuffer();
+    String[] providers = providerPath.split(",");
+    Path path = null;
+    for (String provider: providers) {
+      try {
+        path = unnestUri(new URI(provider));
+        Class<? extends FileSystem> clazz = null;
+        try {
+          String scheme = path.toUri().getScheme();
+          clazz = FileSystem.getFileSystemClass(scheme, config);
+        } catch (IOException ioe) {
+          // not all providers are filesystem based
+          // for instance user:/// will not be able to
+          // have a filesystem class associated with it.
+          if (newProviderPath.length() > 0) {
+            newProviderPath.append(",");
+          }
+          newProviderPath.append(provider);
+        }
+        if (clazz != null) {
+          if (fileSystemClass.isAssignableFrom(clazz)) {
+            LOG.debug("Filesystem based provider" +
+                " excluded from provider path due to recursive dependency: "
+                + provider);
+          } else {
+            if (newProviderPath.length() > 0) {
+              newProviderPath.append(",");
+            }
+            newProviderPath.append(provider);
+          }
+        }
+      } catch (URISyntaxException e) {
+        LOG.warn("Credential Provider URI is invalid." + provider);
+      }
+    }
+
+    String effectivePath = newProviderPath.toString();
+    if (effectivePath.equals(providerPath)) {
+      return config;
+    }
+
+    Configuration conf = new Configuration(config);
+    if (effectivePath.equals("")) {
+      conf.unset(CredentialProviderFactory.CREDENTIAL_PROVIDER_PATH);
+    } else {
+      conf.set(CredentialProviderFactory.CREDENTIAL_PROVIDER_PATH,
+          effectivePath);
+    }
+    return conf;
+  }
+
+  /**
+   * Convert a nested URI to decode the underlying path. The translation takes
+   * the authority and parses it into the underlying scheme and authority.
+   * For example, "myscheme://hdfs@nn/my/path" is converted to
+   * "hdfs://nn/my/path".
+   * @param nestedUri the URI from the nested URI
+   * @return the unnested path
+   */
+  private static Path unnestUri(URI nestedUri) {
+    StringBuilder result = new StringBuilder();
+    String authority = nestedUri.getAuthority();
+    if (authority != null) {
+      String[] parts = nestedUri.getAuthority().split("@", 2);
+      result.append(parts[0]);
+      result.append("://");
+      if (parts.length == 2) {
+        result.append(parts[1]);
+      }
+    }
+    result.append(nestedUri.getPath());
+    if (nestedUri.getQuery() != null) {
+      result.append("?");
+      result.append(nestedUri.getQuery());
+    }
+    if (nestedUri.getFragment() != null) {
+      result.append("#");
+      result.append(nestedUri.getFragment());
+    }
+    return new Path(result.toString());
   }
 }
